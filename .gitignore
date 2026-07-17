@@ -1,0 +1,5 @@
+.DS_Store
+CLAUDE.local.md
+.claude/logs/
+.claude/backups/
+.claude/agent-memory/
