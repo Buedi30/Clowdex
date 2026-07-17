@@ -1,7 +1,10 @@
 #!/bin/bash
-# Stop hook — logs the quality verdict from the haiku review prompt.
-# Writes structured JSONL for trend analysis across sessions.
-# Tracks session blocks and activates quality gate at >=2 blocks.
+# Stop hook (async command) — independently queries haiku for quality verdict and logs it.
+# The prompt hook controls allow/block; this hook handles structured logging.
+#
+# Root cause of prior bug: the prompt hook output is NOT piped to the command hook.
+# Both hooks receive the Stop event JSON independently. This hook calls claude -p
+# separately using last_assistant_message as context for the verdict.
 
 LOG_DIR="$CLAUDE_PROJECT_DIR/.claude/logs"
 VERDICT_LOG="$LOG_DIR/verdicts.jsonl"
@@ -13,26 +16,40 @@ BLOCK_FILE="$LOG_DIR/.session-blocks-$SESSION_DATE"
 
 mkdir -p "$LOG_DIR"
 
-# Read the verdict from stdin (piped from the Stop prompt)
-RAW_VERDICT=$(cat)
+# Read the Stop event JSON
+STOP_EVENT=$(cat)
+LAST_MSG=$(echo "$STOP_EVENT" | jq -r '.last_assistant_message // empty' 2>/dev/null | head -c 2000)
 
-# Strip markdown code fences, collapse to single line, extract JSON object
-VERDICT=$(echo "$RAW_VERDICT" | sed '/^```/d' | tr -d '\n' | grep -o '{.*}')
-# Fallback: try the raw input if extraction failed
-if [ -z "$VERDICT" ]; then
-  VERDICT="$RAW_VERDICT"
-fi
+# Initialize defaults
+DECISION="unknown"
+LEARNING=""
+TASK_TYPE="other"
+REASON=""
 
-# Try to parse as JSON
-DECISION=$(echo "$VERDICT" | jq -r '.decision // empty' 2>/dev/null)
-LEARNING=$(echo "$VERDICT" | jq -r '.learning // empty' 2>/dev/null)
-TASK_TYPE=$(echo "$VERDICT" | jq -r '.task_type // "other"' 2>/dev/null)
-REASON=$(echo "$VERDICT" | jq -r '.reason // empty' 2>/dev/null)
+# Call haiku via claude -p with last_assistant_message as context
+if command -v claude >/dev/null 2>&1 && [ -n "$LAST_MSG" ]; then
+  VERDICT_PROMPT="You are a JSON-only response bot. Based on the last assistant message below, return exactly one JSON object with no other text:
+{\"decision\":\"allow\",\"learning\":null,\"task_type\":\"other\"}
+decision: \"allow\" if the task appears complete, \"block\" if something was clearly missed (add \"reason\" field).
+learning: one-sentence root-cause lesson if an error was fixed, otherwise null.
+task_type: one of build, debug, refactor, test, docs, research, deploy, admin, setup, other.
 
-# Default if not parseable
-if [ -z "$DECISION" ]; then
-  DECISION="unknown"
-  TASK_TYPE="other"
+Last assistant message:
+$LAST_MSG"
+
+  RAW_VERDICT=$(echo "$VERDICT_PROMPT" | claude -p 2>/dev/null | head -c 1000)
+
+  if [ -n "$RAW_VERDICT" ]; then
+    VERDICT=$(echo "$RAW_VERDICT" | sed '/^```/d' | tr -d '\n' | grep -o '{.*}')
+    if [ -n "$VERDICT" ]; then
+      PARSED_DECISION=$(echo "$VERDICT" | jq -r '.decision // empty' 2>/dev/null)
+      [ -n "$PARSED_DECISION" ] && DECISION="$PARSED_DECISION"
+      LEARNING=$(echo "$VERDICT" | jq -r '.learning // empty' 2>/dev/null)
+      PARSED_TYPE=$(echo "$VERDICT" | jq -r '.task_type // empty' 2>/dev/null)
+      [ -n "$PARSED_TYPE" ] && TASK_TYPE="$PARSED_TYPE"
+      REASON=$(echo "$VERDICT" | jq -r '.reason // empty' 2>/dev/null)
+    fi
+  fi
 fi
 
 # Write JSONL verdict
@@ -55,7 +72,6 @@ if [ "$DECISION" = "block" ]; then
 
   echo "- \`$TIMESTAMP\` | VERDICT | BLOCK | $REASON" >> "$INCIDENT_LOG"
 
-  # Activate quality gate at >=2 blocks in same session
   if [ "$BLOCK_COUNT" -ge 2 ]; then
     touch "$LOG_DIR/.quality-gate-active"
     echo "- \`$TIMESTAMP\` | VERDICT | WARN | Quality gate activated — $BLOCK_COUNT blocks this session" >> "$INCIDENT_LOG"
